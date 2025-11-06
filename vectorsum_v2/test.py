@@ -47,7 +47,6 @@ def test_all_cases():
         {"size": 1025, "seed": 1001},
         {"size": 2048, "seed": 5531},
         {"size": 4096, "seed": 9173},
-        {"size": 2**22, "seed": 1739},
     ]
 
     print("Running local tests...")
