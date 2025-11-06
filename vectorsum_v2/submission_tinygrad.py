@@ -19,17 +19,18 @@ from task import input_t, output_t
 from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.uop.ops import AddrSpace, AxisType, KernelInfo, Ops
 
-THREADS_PER_BLOCK = 128
+THREADS_PER_BLOCK = 256
 WARP_SIZE = 32
-BLOCK_SIZE = 128
+BLOCK_SIZE = 256
 
 
 def sum_kernel(B: UOp, A: UOp) -> UOp:
     sdata = UOp(op=Ops.DEFINE_LOCAL, dtype=dtypes.float32.ptr(BLOCK_SIZE, AddrSpace.LOCAL), arg=0)
 
+    n_blocks = math.ceil(A.shape[0] / BLOCK_SIZE)
     tid = UOp.special(THREADS_PER_BLOCK, "lidx0")
-    bid = UOp.special(math.ceil(A.shape[0] / BLOCK_SIZE), "gidx0")
-    gid = bid * BLOCK_SIZE + tid
+    block_idx_x = UOp.special(n_blocks, "gidx0")
+    gid = block_idx_x * BLOCK_SIZE + tid
 
     valid = gid < A.shape[0]
     value = valid.where(A[gid], 0.0)
@@ -38,14 +39,16 @@ def sum_kernel(B: UOp, A: UOp) -> UOp:
 
     sid = UOp.range(math.ceil(math.log2(BLOCK_SIZE)), 0, AxisType.LOOP)
     s = 1 << sid
-    cond = (tid.mod(s << 1)).eq(0)
-    load = sdata.after(sid)[tid]
-    new_val = load + sdata[tid + s]
-    val = sdata[tid].set(cond.where(new_val, load))
+    index = s.mul(2).mul(tid)
+    valid_access = (index + s) < BLOCK_SIZE
+    index_valid = index.valid(valid_access)
+    load = sdata.after(sid)[index_valid]
+    new_val = load + sdata[(index + s).valid(valid_access)]
+    val = sdata[index_valid].set(new_val)
     val = sdata.after(val.barrier()).end(sid)
 
     final_sum = sdata.after(val)[0]
-    B = B[bid].set(final_sum)
+    B = B[block_idx_x].set(final_sum)
 
     return B.sink(arg=KernelInfo(name="sum_kernel", opts_to_apply=()))
 
