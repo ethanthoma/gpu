@@ -12,6 +12,7 @@ except (ImportError, AttributeError):
     )
     import tinygrad
 
+import ctypes
 import math
 
 import torch
@@ -19,9 +20,28 @@ from task import input_t, output_t
 from tinygrad import Context, Tensor, UOp, dtypes
 from tinygrad.uop.ops import AddrSpace, AxisType, KernelInfo, Ops
 
-THREADS_PER_BLOCK = 256
+THREADS_PER_BLOCK = 256 * 4
 WARP_SIZE = 32
-BLOCK_SIZE = 256
+BLOCK_SIZE = 256 * 4
+
+
+def torch_to_tinygrad(torch_tensor: torch.Tensor) -> Tensor:
+    return Tensor.from_blob(torch_tensor.data_ptr(), dtype=dtypes.float32, shape=torch_tensor.shape)
+
+
+def tinygrad_to_torch(tg_tensor: Tensor, dtype: torch.dtype = torch.float32, shape: tuple = ()) -> torch.Tensor:
+    result = torch.empty(shape, dtype=dtype, device="cuda")
+    tg_buf = tg_tensor.uop.base.buffer
+
+    cudart = ctypes.CDLL("libcudart.so")
+    cudart.cudaMemcpy(
+        ctypes.c_void_p(result.data_ptr()),
+        ctypes.c_void_p(tg_buf._buf.value),
+        ctypes.c_size_t(tg_buf.nbytes),
+        ctypes.c_int(3),
+    )
+
+    return result
 
 
 def sum_kernel(B: UOp, A: UOp) -> UOp:
@@ -54,9 +74,11 @@ def sum_kernel(B: UOp, A: UOp) -> UOp:
 
 def custom_kernel(data: input_t) -> output_t:
     input, output = data
-    A = Tensor.from_blob(input.data_ptr(), dtype=dtypes.float32, shape=input.shape)
+    A = torch_to_tinygrad(input)
     n_blocks = math.ceil(A.shape[0] / (BLOCK_SIZE * 2))
     B = Tensor.empty((n_blocks,), dtype=dtypes.float32)
+
+    print(A.shape[0], n_blocks)
 
     with Context(DEBUG=0):
         Tensor.realize(A, B)
@@ -65,4 +87,4 @@ def custom_kernel(data: input_t) -> output_t:
     B.realize()
 
     with Context(DEBUG=0):
-        return torch.from_numpy(B.numpy()).to(output.device)
+        return tinygrad_to_torch(B, dtype=torch.float32, shape=())
