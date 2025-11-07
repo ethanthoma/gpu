@@ -14,15 +14,15 @@ except (ImportError, AttributeError):
 
 import ctypes
 import math
+import time
 
 import torch
 from task import input_t, output_t
-from tinygrad import Context, Tensor, UOp, dtypes
+from tinygrad import Context, Device, Tensor, UOp, dtypes
 from tinygrad.uop.ops import AddrSpace, AxisType, KernelInfo, Ops
 
-THREADS_PER_BLOCK = 256 * 4
 WARP_SIZE = 32
-BLOCK_SIZE = 256 * 4
+BLOCK_SIZE = 256
 
 
 def torch_to_tinygrad(torch_tensor: torch.Tensor) -> Tensor:
@@ -44,20 +44,20 @@ def tinygrad_to_torch(tg_tensor: Tensor, dtype: torch.dtype = torch.float32, sha
     return result
 
 
-def sum_kernel(B: UOp, A: UOp) -> UOp:
-    sdata = UOp(op=Ops.DEFINE_LOCAL, dtype=dtypes.float32.ptr(BLOCK_SIZE, AddrSpace.LOCAL), arg=0)
+def sum_kernel(B: UOp, A: UOp, block_size: int) -> UOp:
+    sdata = UOp(op=Ops.DEFINE_LOCAL, dtype=dtypes.float32.ptr(block_size, AddrSpace.LOCAL), arg=0)
 
-    n_blocks = math.ceil(A.shape[0] / (BLOCK_SIZE * 2))
-    tid = UOp.special(THREADS_PER_BLOCK, "lidx0")
+    n_blocks = math.ceil(A.shape[0] / (block_size * 2))
+    tid = UOp.special(block_size, "lidx0")
     block_idx_x = UOp.special(n_blocks, "gidx0")
-    gid = block_idx_x * BLOCK_SIZE * 2 + tid
+    gid = block_idx_x * block_size * 2 + tid
 
-    value = A[gid.valid(gid < A.shape[0])] + A[(gid + BLOCK_SIZE).valid(gid + BLOCK_SIZE < A.shape[0])]
+    value = A[gid.valid(gid < A.shape[0])] + A[(gid + block_size).valid(gid + block_size < A.shape[0])]
     sdata = sdata[tid].set(value)
     sdata = sdata.after(sdata.barrier())
 
-    sid = UOp.range(math.ceil(math.log2(BLOCK_SIZE)), 0, AxisType.LOOP)
-    s = (BLOCK_SIZE // 2) >> sid
+    sid = UOp.range(math.ceil(math.log2(block_size)), 0, AxisType.LOOP)
+    s = (block_size // 2) >> sid
 
     cond = tid < s
     load = sdata.after(sid)[tid.valid(cond)]
@@ -72,19 +72,60 @@ def sum_kernel(B: UOp, A: UOp) -> UOp:
     return B.sink(arg=KernelInfo(name="sum_kernel", opts_to_apply=()))
 
 
+tunings = {}
+
+
+def auto_tune(N: int, warmup: int = 2, trials: int = 5):
+    global BLOCK_SIZE, tunings
+
+    if N in tunings:
+        return tunings[N]
+
+    block_sizes = [2**i for i in range(7, 14)]
+    results = {}
+
+    input_tensor = Tensor.randn(N, dtype=dtypes.float32)
+
+    with Context(DEBUG=0):
+        for block_size in block_sizes:
+            try:
+                A = input_tensor.clone()
+                n_blocks = math.ceil(A.shape[0] / (block_size * 2))
+                B = Tensor.empty((n_blocks,), dtype=dtypes.float32)
+                Tensor.realize(A, B)
+
+                for _ in range(warmup):
+                    Tensor.custom_kernel(B, A, fxn=lambda b, a: sum_kernel(b, a, block_size))[0].sum().realize()
+
+                torch.cuda.synchronize()
+                times = []
+                for _ in range(trials):
+                    start = time.perf_counter()
+                    Tensor.custom_kernel(B, A, fxn=lambda b, a: sum_kernel(b, a, block_size))[0].sum().realize()
+                    torch.cuda.synchronize()
+                    times.append(time.perf_counter() - start)
+
+                results[block_size] = sum(times) / len(times)
+            except:
+                continue
+
+    BLOCK_SIZE = min(results, key=results.get)
+    tunings[N] = BLOCK_SIZE
+
+
+auto_tune(52428800)
+
+
 def custom_kernel(data: input_t) -> output_t:
     input, output = data
     A = torch_to_tinygrad(input)
     n_blocks = math.ceil(A.shape[0] / (BLOCK_SIZE * 2))
     B = Tensor.empty((n_blocks,), dtype=dtypes.float32)
 
-    print(A.shape[0], n_blocks)
-
     with Context(DEBUG=0):
         Tensor.realize(A, B)
 
-    B = Tensor.custom_kernel(B, A, fxn=sum_kernel)[0].sum()
-    B.realize()
+    B = Tensor.custom_kernel(B, A, fxn=lambda b, a: sum_kernel(b, a, BLOCK_SIZE))[0].sum().realize()
 
     with Context(DEBUG=0):
         return tinygrad_to_torch(B, dtype=torch.float32, shape=())
