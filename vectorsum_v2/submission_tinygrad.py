@@ -45,29 +45,37 @@ def tinygrad_to_torch(tg_tensor: Tensor, dtype: torch.dtype = torch.float32, sha
 
 
 def sum_kernel(B: UOp, A: UOp, block_size: int) -> UOp:
+    # extern __shared__ int sdata[];
     sdata = UOp(op=Ops.DEFINE_LOCAL, dtype=dtypes.float32.ptr(block_size, AddrSpace.LOCAL), arg=0)
 
-    n_blocks = math.ceil(A.shape[0] / (block_size * 2))
+    # unsigned int tid = threadIdx.x;
     tid = UOp.special(block_size, "lidx0")
-    block_idx_x = UOp.special(n_blocks, "gidx0")
+    # unsigned int i = blockIdx.x*(blockDim.x*2) + threadIdx.x;
+    block_idx_x = UOp.special(math.ceil(A.shape[0] / (block_size * 2)), "gidx0")
     gid = block_idx_x * block_size * 2 + tid
 
+    # sdata[tid] = g_in_data[i] + g_in_data[i+blockDim.x];
+    # __syncthreads();
     value = A[gid.valid(gid < A.shape[0])] + A[(gid + block_size).valid(gid + block_size < A.shape[0])]
-    sdata = sdata[tid].set(value)
-    sdata = sdata.after(sdata.barrier())
+    sdata = sdata[tid].src[0].after(sdata[tid].store(value).barrier())
 
+    # for(unsigned int s = blockDim.x/2; s > 0; s >>= 1) {
     sid = UOp.range(math.ceil(math.log2(block_size)), 0, AxisType.LOOP)
     s = (block_size // 2) >> sid
 
-    cond = tid < s
-    load = sdata.after(sid)[tid.valid(cond)]
-    val = load + sdata[(tid + s).valid(cond)]
-    on_cond = sdata[tid.valid(cond)].set(val)
+    # if (tid < s) sdata[tid] += sdata[tid + s];
+    # __syncthreads();
+    sdata = (
+        sdata[tid.valid(tid < s)]
+        .src[0]
+        .after(sdata[tid.valid(tid < s)].store(sdata.after(sid)[tid] + sdata.after(sid)[tid + s]).barrier().end(sid))
+    )
 
-    val = sdata.after(on_cond.barrier()).end(sid)
+    # if (tid < 32) warpReduce(sdata, tid);
+    sdata = sdata[tid.valid(tid < 32)].set(sum(sdata[tid + (32 >> i)] for i in range(7)))
 
-    final_sum = sdata.after(val)[0]
-    B = B[block_idx_x].set(final_sum)
+    # if (tid == 0) g_out_data[blockIdx.x] = sdata[0];
+    B = B[block_idx_x.valid(tid.eq(0))].set(sdata[0])
 
     return B.sink(arg=KernelInfo(name="sum_kernel", opts_to_apply=()))
 
@@ -113,7 +121,7 @@ def auto_tune(N: int, warmup: int = 2, trials: int = 5):
     tunings[N] = BLOCK_SIZE
 
 
-auto_tune(52428800)
+# auto_tune(52428800)
 
 
 def custom_kernel(data: input_t) -> output_t:
@@ -125,7 +133,7 @@ def custom_kernel(data: input_t) -> output_t:
     with Context(DEBUG=0):
         Tensor.realize(A, B)
 
-    B = Tensor.custom_kernel(B, A, fxn=lambda b, a: sum_kernel(b, a, BLOCK_SIZE))[0].sum().realize()
+    B = Tensor.custom_kernel(B, A, fxn=lambda b, a: sum_kernel(b, a, BLOCK_SIZE))[0].realize()
 
     with Context(DEBUG=0):
-        return tinygrad_to_torch(B, dtype=torch.float32, shape=())
+        return tinygrad_to_torch(B.sum().realize(), dtype=torch.float32, shape=())
