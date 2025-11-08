@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -7,7 +8,6 @@ import warnings
 import torch
 import triton.backends.nvidia.driver as triton_driver
 from reference import check_implementation, generate_input
-from submission_tinygrad import custom_kernel
 
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.backends")
 
@@ -40,7 +40,7 @@ def patched_library_dirs():
 triton_driver.library_dirs = patched_library_dirs
 
 
-def test_all_cases():
+def test_all_cases(custom_kernel):
     test_cases = [
         {"size": 1023, "seed": 4242},
         {"size": 1024, "seed": 5236},
@@ -74,4 +74,14 @@ def test_all_cases():
 
 
 if __name__ == "__main__":
-    test_all_cases()
+    if len(sys.argv) > 1:
+        module_path = sys.argv[1]
+    else:
+        module_path = "submission_tinygrad.py"
+
+    spec = importlib.util.spec_from_file_location("submission", module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    custom_kernel = module.custom_kernel
+
+    test_all_cases(custom_kernel)
